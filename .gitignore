@@ -1,0 +1,16 @@
+build/
+cmake-build/
+
+*.exe
+*.exe~
+*.out
+*.obj
+
+.vscode/
+.idea/
+*.code-workspace
+
+.DS_Store
+Thumbs.db
+
+imgui.ini
