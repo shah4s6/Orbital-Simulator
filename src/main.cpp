@@ -65,6 +65,94 @@ float CalculateOrbitalSpeed(float distance, float semiMajorAxis)
     return sqrt(fmaxf(0.1f, velocity)) * 3.0f;
 }
 
+// RK4 ODE: dy/dt = f(t, y)
+// Runge-Kutta 4th Order
+// void RK4_Method(double(*f)(double t, double y), double y0, double t0, double h)
+// {
+//     double t = t0;
+//     double y = y0;
+
+//     // Compute the four slopes
+//     double k1 = f(t, y);
+//     double k2 = f(t + h/2.0, y + (k1/2.0) * h);
+//     double k3 = f(t + h/2.0, y + (k2/2.0) * h);
+//     double k4 = f(t + h, y + k3 * h);
+
+//     // Update y using weighted average of slopes
+//     y = y + (1/6) * (k1 + 2 * k2 + 2 * k3 + k4) * h;
+
+//     return y;
+// }
+
+// Satellite has 6 state variables (position and velocity in the x, y, z directions)
+
+struct StateVariables
+{
+    Eigen::Vector3d position;
+    Eigen::Vector3d velocity;
+};
+
+// Using ODE45 like in MATLAB
+StateVariables calculateDerivatives(const StateVariables& state, double t, double GM)
+{
+    StateVariables derivative;
+    // r = position, dr/dt = velocity
+    derivative.position = state.velocity;
+
+    // dv/dt = acceleration
+    Eigen::Vector3d r = state.position;
+    double r_magnitude = r.norm();
+
+    if (r_magnitude > 0.01)
+    {
+        // F = GM m / r^2 = ma -> a = -GM*r_hat/r^3
+        derivative.velocity = -GM * r / (r_magnitude * r_magnitude * r_magnitude);
+    }
+    else
+    {
+        derivative.velocity = Eigen::Vector3d(0.0, 0.0, 0.0);
+    }
+
+    return derivative;
+}
+
+void rk4Method(Satellite& sat, double dt, double GM)
+{
+    // Initialize the time
+    double t = 0.0;
+
+    // Current state
+    StateVariables current;
+    current.position = sat.position;
+    current.velocity = sat.velocity;
+
+    // k1: Derivative at the start of the interval
+    StateVariables k1 = calculateDerivatives(current, t, GM);
+
+    // k2: Derivative at the midpoint
+    StateVariables state_k2;
+    state_k2.position = current.position + k1.position * (dt / 2.0);
+    state_k2.velocity = current.velocity + k1.velocity * (dt / 2.0);
+    StateVariables k2 = calculateDerivatives(state_k2, t + dt / 2.0, GM);
+
+    // k3: Derivative at another midpoint
+    StateVariables state_k3;
+    state_k3.position = current.position + k2.position * (dt / 2.0);
+    state_k3.velocity = current.velocity + k2.velocity * (dt / 2.0);
+    StateVariables k3 = calculateDerivatives(state_k3, t + dt / 2.0, GM);
+
+    // k4: Derivative at the end of the interval
+    StateVariables state_k4;
+    state_k4.position = current.position + k3.position * dt;
+    state_k4.velocity = current.velocity + k3.velocity * dt;
+    StateVariables k4 = calculateDerivatives(state_k4, t + dt, GM);
+
+    // y_new = y_current + (k1 + 2k2 + 2k3 + k4) * dt/6
+    sat.position = current.position + (k1.position + 2.0*k2.position + 2.0*k3.position + k4.position) * (dt / 6.0);
+    sat.velocity = current.velocity + (k1.velocity + 2.0*k2.velocity + 2.0*k3.velocity + k4.velocity) * (dt / 6.0);
+
+}
+
 int main()
 {
     InitWindow(1080, 720, "Orbit Simulator");
@@ -101,6 +189,8 @@ int main()
     Telemetry telemetry = {0};
     bool auto_rotate = true;
 
+    bool use2p5D = true;
+
     while (!WindowShouldClose())
     {
         float dt = GetFrameTime();
@@ -112,8 +202,25 @@ int main()
 
             Eigen::Vector3d acceleration = -GM * r / (r_magnitude * r_magnitude * r_magnitude);
 
-            sat.velocity += acceleration * dt;
-            sat.position += sat.velocity * dt;
+            rk4Method(sat, dt, GM);
+
+            if (use2p5D)
+            {
+                sat.position.y() = 0.0;
+                sat.velocity.y() = 0.0;
+            }
+        }
+
+        if (use2p5D)
+        {
+            // Fixed camera for debugging
+            camera.position = (Vector3){0.0f, 15.0f, 10.0f};
+            camera.target = (Vector3){0.0f, 0.0f, 0.0f};
+            camera.up = (Vector3){0.0f, 1.0f, 0.0f};
+        }
+        else if (IsMouseButtonDown(MOUSE_RIGHT_BUTTON))
+        {
+            UpdateCamera(&camera, CAMERA_FIRST_PERSON);
         }
         
         // Update telemetry
@@ -149,11 +256,6 @@ int main()
         // Calculate satellite position
         Vector3 satellitePos = {(float)sat.position.x(), (float)sat.position.y(), (float)sat.position.z()};
 
-        if (IsMouseButtonDown(MOUSE_RIGHT_BUTTON))
-        {
-            UpdateCamera(&camera, CAMERA_ORBITAL);
-        }
-
         BeginDrawing();
         ClearBackground(DARKERGRAY);
 
@@ -173,7 +275,7 @@ int main()
 
         // ImGui::SliderFloat("Semi-Major Axis (a)",&semiMajorAxis, 2.0f, 8.0f);    TODO: Reimplement this slider correctly
         // ImGui::SliderFloat("Eccentricity (e)",&eccentricity, 0.0f, 0.99f);       TODO: Reimplement this slider correctly
-        // ImGui::SliderFloat("Speed", &telemetry.velocity, 0.0f, 5.0f);            TODO: Reimplement this slider correctly
+        // ImGui::SliderFloat("Speed", &telemetry.velocity, 0.0f, 5.0f);            TODO:Reimplement this slider correctly
         ImGui::Checkbox("Automatic Rotation", &auto_rotate);
         ImGui::Separator();
         ImGui::Text("Distance: %.2f", telemetry.distance);
@@ -181,6 +283,8 @@ int main()
         ImGui::TextColored(ImVec4 (0.0f, 1.0f, 0.0f, 1.0f), "Perigee: %.2f", telemetry.perigee);
         ImGui::TextColored(ImVec4 (1.0f, 1.0f, 0.0f, 1.0f), "Apogee: %.2f", telemetry.apogee);
         ImGui::Separator();
+
+        ImGui::Checkbox("Debug Mode (Top Down)", &use2p5D);
 
         if (ImGui::Button("Reset"))
         {
