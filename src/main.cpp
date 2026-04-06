@@ -14,6 +14,7 @@ struct Telemetry
     float apogee;
     float semiMajorAxis;
     float eccentricity;
+    // TODO: Add ground track
 };
 
 struct Satellite
@@ -25,7 +26,7 @@ struct Satellite
 
 
 // Helper function to draw an elliptical orbit
-void DrawOrbitEllipse(Vector3 focus, float semiMajorAxis, float eccentricity, Color color)
+void DrawOrbitEllipse(Vector3 focus, float semiMajorAxis, float eccentricity, float inclination, Color color)
 {
     if (eccentricity >= 1.0f) return; // e - amound of stretched (0 = circle, <1 = ellipse)
 
@@ -34,20 +35,23 @@ void DrawOrbitEllipse(Vector3 focus, float semiMajorAxis, float eccentricity, Co
     float semiMinorAxis = semiMajorAxis * sqrt(1 - eccentricity * eccentricity);
 
     int segments = 200;
+    float inclinationRadian = inclination * PI / 180.0f;
+    float cosInclination = cos(inclinationRadian);
+    float sinInclination = sin(inclinationRadian);
     for (int i = 0; i < segments; i++)
     {
         float angle1 = (float)i / segments * 2 * PI;
         float angle2 = (float)(i + 1) / segments * 2 * PI;
-            
+
         Vector3 p1 = {
             center.x + semiMajorAxis * cos(angle1),
-            center.y,
-            center.z + semiMinorAxis * sin(angle1)
+            center.y + semiMinorAxis * sin(angle1) * sinInclination,
+            center.z + semiMinorAxis * sin(angle1) * cosInclination
         };
         Vector3 p2 = {
             center.x + semiMajorAxis * cos(angle2),
-            center.y,
-            center.z + semiMinorAxis * sin(angle2)
+            center.y + semiMinorAxis * sin(angle2) * sinInclination,
+            center.z + semiMinorAxis * sin(angle2) * cosInclination
         };
         DrawLine3D(p1, p2, color);
     }
@@ -187,9 +191,21 @@ int main()
     float satelliteRadius = 0.5f;
 
     Telemetry telemetry = {0};
-    bool auto_rotate = true;
 
+    // UI
+    bool auto_rotate = true;
     bool use2p5D = true;
+
+    static float semiMajorAxisUI = semiMajorAxis;
+    static float eccentricityUI = eccentricity;
+    bool orbitChanged = false;
+
+    bool followSatellite = false;
+
+    // Inclination variable to enable 3D orbits
+    float inclination = 0.0f;           // Current inclination (degrees)
+    float inclinationTarget = 0.0f;     // Target inclination obtained by the slider (degrees)
+    bool inclinationChanged = false;
 
     while (!WindowShouldClose())
     {
@@ -197,22 +213,22 @@ int main()
 
         if (auto_rotate)
         {
+            rk4Method(sat, dt, GM);
+
             Eigen::Vector3d r = sat.position;
             double r_magnitude = r.norm();
 
             Eigen::Vector3d acceleration = -GM * r / (r_magnitude * r_magnitude * r_magnitude);
-
-            rk4Method(sat, dt, GM);
-
-            if (use2p5D)
-            {
-                sat.position.y() = 0.0;
-                sat.velocity.y() = 0.0;
-            }
         }
 
         if (use2p5D)
         {
+            if (inclination == 0.0f)
+            {
+                sat.position.y() = 0.0;
+                sat.velocity.y() = 0.0;
+            }
+
             // Fixed camera for debugging
             camera.position = (Vector3){0.0f, 15.0f, 10.0f};
             camera.target = (Vector3){0.0f, 0.0f, 0.0f};
@@ -263,25 +279,103 @@ int main()
         DrawSphere(earthPos, earthRadius, BLUE);
         DrawSphere(satellitePos, satelliteRadius, RED);
         DrawLine3D(earthPos, satellitePos, YELLOW);
-        DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, WHITE);
+        DrawLine3D((Vector3){0.0f, 0.0f, 0.0f}, (Vector3){10.0f, 0.0f, 0.0f}, RED);
+        DrawLine3D((Vector3){0.0f, 0.0f, 0.0f}, (Vector3){0.0f, 10.0f, 0.0f}, GREEN);
+        DrawLine3D((Vector3){0.0f, 0.0f, 0.0f}, (Vector3){0.0f, 0.0f, 10.0f}, BLUE);
+
+        if (!use2p5D || inclination == 0.0f)
+        {
+            DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, inclination, WHITE);
+        }
+        else
+        {
+            DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, 0.0f, WHITE);
+        }
         DrawSphere(perigeePos, 0.1f, GREEN);
         DrawSphere(apogeePos, 0.1f, YELLOW);
+        DrawCircle3D(earthPos, 6.0f, (Vector3){1.0f, 0.0f, 0.0f}, 90.0f, LIGHTGRAY);
         DrawGrid(10, 1.0f);
         EndMode3D();
 
         rlImGuiBegin();
         ImGui::Begin("Window");
-        ImGui::Text("Hold the right mouse button to rotate the view");
+        orbitChanged |= ImGui::SliderFloat("Semi-Major Axis (a)", &semiMajorAxisUI, 2.0f, 8.0f);
+        orbitChanged |= ImGui::SliderFloat("Eccentricity (e)", &eccentricityUI, 0.0f, 0.99f);
 
-        // ImGui::SliderFloat("Semi-Major Axis (a)",&semiMajorAxis, 2.0f, 8.0f);    TODO: Reimplement this slider correctly
-        // ImGui::SliderFloat("Eccentricity (e)",&eccentricity, 0.0f, 0.99f);       TODO: Reimplement this slider correctly
+        if (orbitChanged)
+        {
+            semiMajorAxis = semiMajorAxisUI;
+            eccentricity = eccentricityUI;
+            double r_initial = semiMajorAxis * (1 - eccentricity);
+            sat.position = Eigen::Vector3d(r_initial, 0.0, 0.0);
+            double v_perigee = sqrt(GM * (1 + eccentricity) / (semiMajorAxis * (1 - eccentricity)));
+            sat.velocity = Eigen::Vector3d(0.0, 0.0, v_perigee);
+
+            if (inclination != 0.0f)
+            {
+                inclinationChanged = true;
+            }
+
+            orbitChanged = false;
+        }
         // ImGui::SliderFloat("Speed", &telemetry.velocity, 0.0f, 5.0f);            TODO:Reimplement this slider correctly
+        ImGui::SliderFloat("Inclination (i)", &inclinationTarget, 0, 180, "%0.0f");
+        // Display orbit type based on the inclination
+        if (inclinationTarget < 90.0)
+        {
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "PROGRADE (i < 90°)");
+        }
+        else if (inclinationTarget > 90.0f)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.5f, 1.0f), "RETROGRADE (i > 90°)");
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "POLAR (i = 90°)");
+        }
+
+        if (inclinationTarget != inclination)
+        {
+            inclination = inclinationTarget;
+            inclinationChanged = true;
+        }
+
+        // Apply the inclination only when the inclination is changed
+        if (inclinationChanged)
+        {
+            double semiMajorAxis = semiMajorAxisUI;
+            double eccentricity = eccentricityUI;
+            double r_perigee = semiMajorAxisUI * (1 - eccentricityUI);
+            double v_perigee_magnitude = sqrt(GM * (1 + eccentricityUI) / (semiMajorAxisUI * (1 - eccentricityUI)));
+
+            // Position at perigee and velocity
+            Eigen::Vector3d perigeeInclinationPos(r_perigee, 0.0, 0.0);
+            Eigen::Vector3d perigeeInclinationVel(0.0, 0.0, v_perigee_magnitude);
+
+            // For test purposes inclination is about the x-axis
+            double radian = inclination * PI / 180.0;
+            double cos_radian = cos(radian);
+            double sin_radian = sin(radian);
+
+            // Incline position
+            sat.position = Eigen::Vector3d(perigeeInclinationPos.x(), perigeeInclinationPos.y() * cos_radian - perigeeInclinationPos.z() * sin_radian, perigeeInclinationPos.y() * sin_radian + perigeeInclinationPos.z() * cos_radian);
+
+            // Incline velocity
+            sat.velocity = Eigen::Vector3d(perigeeInclinationVel.x(), perigeeInclinationVel.y() * cos_radian - perigeeInclinationVel.z() * sin_radian, perigeeInclinationVel.y() * sin_radian + perigeeInclinationVel.z() * cos_radian);
+
+            inclinationChanged = false;
+        }
+
+        
         ImGui::Checkbox("Automatic Rotation", &auto_rotate);
         ImGui::Separator();
         ImGui::Text("Distance: %.2f", telemetry.distance);
         ImGui::Text("True Anomaly: %.1f", telemetry.trueAnomaly);
         ImGui::TextColored(ImVec4 (0.0f, 1.0f, 0.0f, 1.0f), "Perigee: %.2f", telemetry.perigee);
         ImGui::TextColored(ImVec4 (1.0f, 1.0f, 0.0f, 1.0f), "Apogee: %.2f", telemetry.apogee);
+        ImGui::TextColored(ImVec4 (1.0f, 0.0f, 0.0f, 1.0f), "X");
+        ImGui::TextColored(ImVec4 (0.0f, 1.0f, 0.0f, 1.0f), "Y");
+        ImGui::TextColored(ImVec4 (0.0f, 0.0f, 1.0f, 1.0f), "Z");
         ImGui::Separator();
 
         ImGui::Checkbox("Debug Mode (Top Down)", &use2p5D);
@@ -290,6 +384,8 @@ int main()
         {
             semiMajorAxis = 5.0f;
             eccentricity = 0.6f;
+            inclination = 0.0f;
+            inclinationTarget = 0.0f;
             auto_rotate = true;
             
             // Reset satellite state
