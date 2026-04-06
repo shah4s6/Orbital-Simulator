@@ -276,7 +276,8 @@ int main()
         ClearBackground(DARKERGRAY);
 
         BeginMode3D(camera);
-        DrawSphere(earthPos, earthRadius, BLUE);
+        DrawSphere(earthPos, earthRadius, DARKBLUE);
+        DrawSphereWires(earthPos, earthRadius, 16, 16, LIGHTGRAY);
         DrawSphere(satellitePos, satelliteRadius, RED);
         DrawLine3D(earthPos, satellitePos, YELLOW);
         DrawLine3D((Vector3){0.0f, 0.0f, 0.0f}, (Vector3){10.0f, 0.0f, 0.0f}, RED);
@@ -298,9 +299,77 @@ int main()
         EndMode3D();
 
         rlImGuiBegin();
-        ImGui::Begin("Window");
+        // Telemetry Panel (Left)
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(260, 300), ImGuiCond_Always);
+        ImGui::Begin("Telemetry", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+        ImGui::Text("Orbital Data");
+        ImGui::Separator();
+        
+        ImGui::Text("Distance: %.2f", telemetry.distance);
+        ImGui::Text("Speed: %.2f", telemetry.velocity);
+        ImGui::Text("True Anomaly: %.2f", telemetry.trueAnomaly);
+        ImGui::Separator();
+
+        ImGui::Text("Orbital Elements");
+        ImGui::Text("Semi-Major Axis(a)", telemetry.semiMajorAxis);
+        ImGui::Text("Eccentricity: %.2f", telemetry.eccentricity);
+        ImGui::Separator();
+
+        ImGui::TextColored(ImVec4 (0.0f, 1.0f, 0.0f, 1.0f), "Perigee: %.2f", telemetry.perigee);
+        ImGui::TextColored(ImVec4 (1.0f, 1.0f, 0.0f, 1.0f), "Apogee: %.2f", telemetry.apogee);
+
+        ImGui::End();
+
+        // Orbit Controls Panel (Right)
+        ImGui::SetNextWindowPos(ImVec2(GetScreenWidth() - 270, 10), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(260, 320), ImGuiCond_Always);
+        ImGui::Begin("Orbit Controls", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+        ImGui::Text("Parameters");
+        ImGui::Separator();
+
         orbitChanged |= ImGui::SliderFloat("Semi-Major Axis (a)", &semiMajorAxisUI, 2.0f, 8.0f);
         orbitChanged |= ImGui::SliderFloat("Eccentricity (e)", &eccentricityUI, 0.0f, 0.99f);
+
+        ImGui::SliderFloat("Inclination (i)", &inclinationTarget, 0, 180, "%0.0f");
+
+        // Display orbit type based on the inclination
+        if (inclinationTarget < 90.0)
+        {
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "PROGRADE (i < 90°)");
+        }
+        else if (inclinationTarget > 90.0f)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.5f, 1.0f), "RETROGRADE (i > 90°)");
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "POLAR (i = 90°)");
+        }
+        ImGui::Separator();
+
+        if (ImGui::Button("Reset Orbit"))
+        {
+            semiMajorAxis = 5.0f;
+            eccentricity = 0.6f;
+            inclination = 0.0f;
+            inclinationTarget = 0.0f;
+            auto_rotate = true;
+            
+            // Reset satellite state
+            double r_initial = semiMajorAxis * (1 - eccentricity);
+            sat.position = Eigen::Vector3d(r_initial, 0.0, 0.0);
+
+            double v_perigee = sqrt(GM * (1 + eccentricity) / (semiMajorAxis * (1 - eccentricity)));
+            sat.velocity = Eigen::Vector3d(0.0, 0.0, v_perigee);
+        }
+        ImGui::End();
+
+        // Time Controls Panel (Bottom)
+        ImGui::SetNextWindowPos(ImVec2(GetScreenWidth()/2 - 150, GetScreenHeight() - 140), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(300, 120), ImGuiCond_Always);
+        ImGui::Begin("Time Controls", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+        ImGui::Separator();
 
         if (orbitChanged)
         {
@@ -317,21 +386,6 @@ int main()
             }
 
             orbitChanged = false;
-        }
-        // ImGui::SliderFloat("Speed", &telemetry.velocity, 0.0f, 5.0f);            TODO:Reimplement this slider correctly
-        ImGui::SliderFloat("Inclination (i)", &inclinationTarget, 0, 180, "%0.0f");
-        // Display orbit type based on the inclination
-        if (inclinationTarget < 90.0)
-        {
-            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "PROGRADE (i < 90°)");
-        }
-        else if (inclinationTarget > 90.0f)
-        {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.5f, 1.0f), "RETROGRADE (i > 90°)");
-        }
-        else
-        {
-            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "POLAR (i = 90°)");
         }
 
         if (inclinationTarget != inclination)
@@ -368,32 +422,7 @@ int main()
 
         
         ImGui::Checkbox("Automatic Rotation", &auto_rotate);
-        ImGui::Separator();
-        ImGui::Text("Distance: %.2f", telemetry.distance);
-        ImGui::Text("True Anomaly: %.1f", telemetry.trueAnomaly);
-        ImGui::TextColored(ImVec4 (0.0f, 1.0f, 0.0f, 1.0f), "Perigee: %.2f", telemetry.perigee);
-        ImGui::TextColored(ImVec4 (1.0f, 1.0f, 0.0f, 1.0f), "Apogee: %.2f", telemetry.apogee);
-        ImGui::TextColored(ImVec4 (1.0f, 0.0f, 0.0f, 1.0f), "X");
-        ImGui::TextColored(ImVec4 (0.0f, 1.0f, 0.0f, 1.0f), "Y");
-        ImGui::TextColored(ImVec4 (0.0f, 0.0f, 1.0f, 1.0f), "Z");
-        ImGui::Separator();
-
-        ImGui::Checkbox("Debug Mode (Top Down)", &use2p5D);
-
-        if (ImGui::Button("Reset"))
-        {
-            semiMajorAxis = 5.0f;
-            eccentricity = 0.6f;
-            inclination = 0.0f;
-            inclinationTarget = 0.0f;
-            auto_rotate = true;
-            
-            // Reset satellite state
-            double r_initial = semiMajorAxis * (1 - eccentricity);
-            sat.position = Eigen::Vector3d(r_initial, 0.0, 0.0);
-            double v_perigee = sqrt(GM * (1 + eccentricity) / (semiMajorAxis * (1 - eccentricity)));
-            sat.velocity = Eigen::Vector3d(0.0, 0.0, v_perigee);
-        }
+        ImGui::Checkbox("Top-Down View", &use2p5D);
 
         ImGui::End();
         rlImGuiEnd();
