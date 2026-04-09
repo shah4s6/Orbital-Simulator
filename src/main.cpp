@@ -24,7 +24,6 @@ struct Satellite
     double mass;
 };
 
-
 // Helper function to draw an elliptical orbit
 void DrawOrbitEllipse(Vector3 focus, float semiMajorAxis, float eccentricity, float inclination, Color color)
 {
@@ -67,6 +66,21 @@ float CalculateOrbitalSpeed(float distance, float semiMajorAxis)
     // M is the mass of the central body
     float velocity = 2.0f / distance - 1.0f / semiMajorAxis;
     return sqrt(fmaxf(0.1f, velocity)) * 3.0f;
+}
+
+float CalculateInclination(const Eigen::Vector3d& position, const Eigen::Vector3d & velocity)
+{
+    Eigen::Vector3d angularMomentum = position.cross(velocity);
+    double incline = acos(angularMomentum.z() / angularMomentum.norm() * 180.0 / PI);
+    return incline;
+}
+
+float CalculateRequiredDeltaV(double currentSemiMajorAxis, double targetSemiMajorAxis, double GM, double currentVel)
+{
+    // Hohmann transfer approximation
+    double currentOrbitSpeed = sqrt(GM / currentSemiMajorAxis);
+    double targetOrbitSpeed = sqrt(GM / targetSemiMajorAxis);
+    return targetOrbitSpeed - currentOrbitSpeed;
 }
 
 // RK4 ODE: dy/dt = f(t, y)
@@ -159,7 +173,7 @@ void rk4Method(Satellite& sat, double dt, double GM)
 
 int main()
 {
-    InitWindow(1080, 720, "Orbit Simulator");
+    InitWindow(1400, 1040, "Orbit Simulator");
     rlImGuiSetup(true);
 
     const double GM = 15.0;
@@ -192,28 +206,45 @@ int main()
 
     Telemetry telemetry = {0};
 
+    // Trail for the satellite path
+    std::vector<Vector3> trail;
+    float trailTimer = 0.0f;
+
     // UI
     bool auto_rotate = true;
     bool use2p5D = true;
-
     static float semiMajorAxisUI = semiMajorAxis;
     static float eccentricityUI = eccentricity;
     bool orbitChanged = false;
+    bool isManeuvering = false;
+    float maneuverProgress = 0.0f;
 
     bool followSatellite = false;
 
+    // Target orbit visualization
+    float targetSemiMajorAxis = semiMajorAxis;
+    float targetEccentricity = eccentricity;
+    float targetDisplayInclination = 0.0f;
+    bool showTargetOrbit = false;
+
     // Inclination variable to enable 3D orbits
-    float inclination = 0.0f;           // Current inclination (degrees)
-    float inclinationTarget = 0.0f;     // Target inclination obtained by the slider (degrees)
-    bool inclinationChanged = false;
+    float currentInclination = 0.0f;           // Current inclination (degrees)
+    float targetInclination = 0.0f;            // Target inclination obtained by the slider (degrees)
+    bool isInclining = false;
+    float deltaV = 10.0f;
+    static float timeWarp = 1.0f; // Initialized at normal speed 1x
+    float targetOrbitTimer = 0.0f;
 
     while (!WindowShouldClose())
     {
         float dt = GetFrameTime();
 
+        // currentInclination = CalculateInclination(sat.position, sat.velocity);
+
         if (auto_rotate)
         {
-            rk4Method(sat, dt, GM);
+            float dtNew = dt * timeWarp;
+            rk4Method(sat, dtNew, GM);
 
             Eigen::Vector3d r = sat.position;
             double r_magnitude = r.norm();
@@ -223,12 +254,6 @@ int main()
 
         if (use2p5D)
         {
-            if (inclination == 0.0f)
-            {
-                sat.position.y() = 0.0;
-                sat.velocity.y() = 0.0;
-            }
-
             // Fixed camera for debugging
             camera.position = (Vector3){0.0f, 15.0f, 10.0f};
             camera.target = (Vector3){0.0f, 0.0f, 0.0f};
@@ -272,6 +297,20 @@ int main()
         // Calculate satellite position
         Vector3 satellitePos = {(float)sat.position.x(), (float)sat.position.y(), (float)sat.position.z()};
 
+        // Update trail
+        trailTimer += dt;
+        float trailInterval = 0.05 / timeWarp;
+        if (trailTimer >= trailInterval)
+        {
+            trailTimer = 0.0f;
+            trail.push_back(satellitePos);
+
+            while (trail.size() > 800)
+            {
+                trail.erase(trail.begin());
+            }
+        }
+
         BeginDrawing();
         ClearBackground(DARKERGRAY);
 
@@ -279,22 +318,68 @@ int main()
         DrawSphere(earthPos, earthRadius, DARKBLUE);
         DrawSphereWires(earthPos, earthRadius, 16, 16, LIGHTGRAY);
         DrawSphere(satellitePos, satelliteRadius, RED);
+        
+        // Draw a velocity vector
+        if (v_magnitude > 0.01f)
+        {
+            Vector3 start = satellitePos;
+            Vector3 direction = {(float)v.x(), (float)v.y(), (float)v.z()};
+
+            float invMagnitude = 1.0f / v_magnitude;
+            direction.x *= invMagnitude;
+            direction.y *= invMagnitude;
+            direction.z *= invMagnitude;
+
+            float arrowLength = fminf(v_magnitude * 0.5f, 2.0f);
+            Vector3 end = {start.x + direction.x * arrowLength, start.y + direction.y * arrowLength, start.z + direction.z * arrowLength};
+
+            DrawLine3D(start, end, ORANGE);
+        }
+
         DrawLine3D(earthPos, satellitePos, YELLOW);
         DrawLine3D((Vector3){0.0f, 0.0f, 0.0f}, (Vector3){10.0f, 0.0f, 0.0f}, RED);
         DrawLine3D((Vector3){0.0f, 0.0f, 0.0f}, (Vector3){0.0f, 10.0f, 0.0f}, GREEN);
         DrawLine3D((Vector3){0.0f, 0.0f, 0.0f}, (Vector3){0.0f, 0.0f, 10.0f}, BLUE);
 
-        if (!use2p5D || inclination == 0.0f)
+        if (showTargetOrbit)
         {
-            DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, inclination, WHITE);
+            // Draw ghost target orbit when sliders are adjusted
+            Color targetColor = GREEN;
+            DrawOrbitEllipse(earthPos, targetSemiMajorAxis, targetEccentricity, targetDisplayInclination, targetColor);
+
+            targetOrbitTimer += dt;
+            if (targetOrbitTimer > 3.0f)
+            {
+                showTargetOrbit = false;
+                targetOrbitTimer = 0.0f;
+            }
         }
         else
         {
-            DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, 0.0f, WHITE);
+            targetOrbitTimer = 0.0f;
         }
+
+        if (trail.size() > 1)
+        {
+            for (size_t i = 0; i < trail.size() - 1; i++)
+            {
+                Color trailColor = MAGENTA;
+                DrawLine3D(trail[i], trail[i + 1], trailColor);
+            }
+        }
+
+        // Draw current orbit
+        // if (!use2p5D || currentInclination == 0.0f)
+        // {
+        //     DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, currentInclination, WHITE);
+        // }
+        // else
+        // {
+        //     DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, 0.0f, WHITE);
+        // }
+
         DrawSphere(perigeePos, 0.1f, GREEN);
         DrawSphere(apogeePos, 0.1f, YELLOW);
-        DrawCircle3D(earthPos, 6.0f, (Vector3){1.0f, 0.0f, 0.0f}, 90.0f, LIGHTGRAY);
         DrawGrid(10, 1.0f);
         EndMode3D();
 
@@ -312,7 +397,7 @@ int main()
         ImGui::Separator();
 
         ImGui::Text("Orbital Elements");
-        ImGui::Text("Semi-Major Axis(a)", telemetry.semiMajorAxis);
+        ImGui::Text("Semi-Major Axis(a): %.2f", telemetry.semiMajorAxis);
         ImGui::Text("Eccentricity: %.2f", telemetry.eccentricity);
         ImGui::Separator();
 
@@ -328,17 +413,33 @@ int main()
         ImGui::Text("Parameters");
         ImGui::Separator();
 
-        orbitChanged |= ImGui::SliderFloat("Semi-Major Axis (a)", &semiMajorAxisUI, 2.0f, 8.0f);
-        orbitChanged |= ImGui::SliderFloat("Eccentricity (e)", &eccentricityUI, 0.0f, 0.99f);
-
-        ImGui::SliderFloat("Inclination (i)", &inclinationTarget, 0, 180, "%0.0f");
+        ImGui::Text("Semi-Major Axis (a)");
+        if (ImGui::SliderFloat("##semiMajorAxis", &semiMajorAxisUI, 2.0f, 8.0f))
+        {
+            orbitChanged = true;
+            targetSemiMajorAxis = semiMajorAxisUI;
+            showTargetOrbit = true;
+        }
+        ImGui::Text("Eccentricity (e)");
+        if (ImGui::SliderFloat("##eccentricity", &eccentricityUI, 0.0f, 0.99f))
+        {
+            orbitChanged = true;
+            targetEccentricity = eccentricityUI;
+            showTargetOrbit = true;
+        }
+        ImGui::Text("Inclination (i)");
+        if (ImGui::SliderFloat("##inclination", &targetInclination, 0, 180, "%0.0f"))
+        {
+            targetDisplayInclination = targetInclination;
+            showTargetOrbit = true;
+        }
 
         // Display orbit type based on the inclination
-        if (inclinationTarget < 90.0)
+        if (targetInclination < 90.0)
         {
             ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "PROGRADE (i < 90°)");
         }
-        else if (inclinationTarget > 90.0f)
+        else if (targetInclination > 90.0f)
         {
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.5f, 1.0f), "RETROGRADE (i > 90°)");
         }
@@ -348,76 +449,118 @@ int main()
         }
         ImGui::Separator();
 
+        if (showTargetOrbit)
+        {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Target Orbit:");
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Semi-Major Axis %.2f", targetSemiMajorAxis);
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Eccentricity: %.2f", targetEccentricity);
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Inclination: %.0f", targetDisplayInclination);
+        }
+
         if (ImGui::Button("Reset Orbit"))
         {
             semiMajorAxis = 5.0f;
             eccentricity = 0.6f;
-            inclination = 0.0f;
-            inclinationTarget = 0.0f;
+            semiMajorAxisUI = 5.0f;
+            eccentricityUI = 0.6f;
+            currentInclination = 0.0f;
+            targetInclination = 0.0f;
+            targetDisplayInclination = 0.0f;
+            targetSemiMajorAxis = 5.0f;
+            targetEccentricity = 0.6f;
             auto_rotate = true;
+            showTargetOrbit = false;
+            isManeuvering = false;
+            maneuverProgress = 0.0f;
+
+            trail.clear();
             
             // Reset satellite state
             double r_initial = semiMajorAxis * (1 - eccentricity);
             sat.position = Eigen::Vector3d(r_initial, 0.0, 0.0);
-
             double v_perigee = sqrt(GM * (1 + eccentricity) / (semiMajorAxis * (1 - eccentricity)));
             sat.velocity = Eigen::Vector3d(0.0, 0.0, v_perigee);
         }
         ImGui::End();
 
+        // Maneuver Controls Panel (Bottom Right)
+        ImGui::SetNextWindowPos(ImVec2(GetScreenWidth()/2 - 20, GetScreenHeight() - 250), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(260, 180), ImGuiCond_Always);
+        ImGui::Begin("Maneuvers", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+        ImGui::Text("Manual Burns");
+        ImGui::Separator();
+
+        static float burnAmount = 0.5f;
+        ImGui::SliderFloat("Delta-V", &burnAmount, 0.1f, 2.0f, "%.1f m/s");
+
+        ImGui::Text("Prograde/Retrograde");
+        if (ImGui::Button("+ Prograde"))
+        {
+            Eigen::Vector3d v_direction = sat.velocity.normalized();
+            sat.velocity += v_direction * burnAmount;
+        }
+        if (ImGui::Button("- Retrograde"))
+        {
+            Eigen::Vector3d v_direction = sat.velocity.normalized();
+            sat.velocity -= v_direction * burnAmount;
+        }
+
+        ImGui::End();
+
+
         // Time Controls Panel (Bottom)
-        ImGui::SetNextWindowPos(ImVec2(GetScreenWidth()/2 - 150, GetScreenHeight() - 140), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(300, 120), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(GetScreenWidth()/2 - 200, GetScreenHeight() - 150), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(400, 140), ImGuiCond_Always);
         ImGui::Begin("Time Controls", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
         ImGui::Separator();
 
-        if (orbitChanged)
+        ImGui::SliderFloat("Time Warp", &timeWarp, 0.1f, 20.0f, "%.1fx");
+        ImGui::SameLine();
+        ImGui::Text("Simulation Speed: %.1fx", timeWarp);
+
+        if (orbitChanged && auto_rotate && !isManeuvering)
         {
-            semiMajorAxis = semiMajorAxisUI;
-            eccentricity = eccentricityUI;
-            double r_initial = semiMajorAxis * (1 - eccentricity);
-            sat.position = Eigen::Vector3d(r_initial, 0.0, 0.0);
-            double v_perigee = sqrt(GM * (1 + eccentricity) / (semiMajorAxis * (1 - eccentricity)));
-            sat.velocity = Eigen::Vector3d(0.0, 0.0, v_perigee);
-
-            if (inclination != 0.0f)
-            {
-                inclinationChanged = true;
-            }
-
+            // Start manuevering to change the orbit
+            isManeuvering = true;
+            maneuverProgress = 0.0f;
             orbitChanged = false;
         }
 
-        if (inclinationTarget != inclination)
+        
+        Eigen::Vector3d angularMomentum = sat.position.cross(sat.velocity);
+        currentInclination = acos(angularMomentum.z() / angularMomentum.norm() * 180.0 / PI);
+
+        if (isManeuvering && auto_rotate)
         {
-            inclination = inclinationTarget;
-            inclinationChanged = true;
-        }
+            maneuverProgress += dt * timeWarp;
 
-        // Apply the inclination only when the inclination is changed
-        if (inclinationChanged)
-        {
-            double semiMajorAxis = semiMajorAxisUI;
-            double eccentricity = eccentricityUI;
-            double r_perigee = semiMajorAxisUI * (1 - eccentricityUI);
-            double v_perigee_magnitude = sqrt(GM * (1 + eccentricityUI) / (semiMajorAxisUI * (1 - eccentricityUI)));
+            float t = fminf(maneuverProgress / 3.0f, 1.0f);
 
-            // Position at perigee and velocity
-            Eigen::Vector3d perigeeInclinationPos(r_perigee, 0.0, 0.0);
-            Eigen::Vector3d perigeeInclinationVel(0.0, 0.0, v_perigee_magnitude);
+            double targetSemiMajorAxis = semiMajorAxisUI;
+            double currentSemiMajorAxis = telemetry.semiMajorAxis;
 
-            // For test purposes inclination is about the x-axis
-            double radian = inclination * PI / 180.0;
-            double cos_radian = cos(radian);
-            double sin_radian = sin(radian);
+            if (fabs(currentSemiMajorAxis - targetSemiMajorAxis) > 0.05f)
+            {
+                Eigen::Vector3d v_direction = sat.velocity.normalized();
+                double deltaV = (targetSemiMajorAxis - currentSemiMajorAxis) * 0.05 * dt * timeWarp;
+                deltaV = fmin(fmax(deltaV, -0.5), 0.5);
+                sat.velocity += v_direction * deltaV;
+            }
 
-            // Incline position
-            sat.position = Eigen::Vector3d(perigeeInclinationPos.x(), perigeeInclinationPos.y() * cos_radian - perigeeInclinationPos.z() * sin_radian, perigeeInclinationPos.y() * sin_radian + perigeeInclinationPos.z() * cos_radian);
+            if (abs(targetInclination - currentInclination) > 0.5f)
+            {
+                Eigen::Vector3d r = sat.position;
+                Eigen::Vector3d v = sat.velocity;
+                Eigen::Vector3d normal = r.cross(v).normalized();
+                double direction = (targetInclination - currentInclination > 0) ? 1.0f : -1.0f;
+                double deltaV = direction * 0.08 * dt * timeWarp;
+                sat.velocity += normal * deltaV;
+            }
 
-            // Incline velocity
-            sat.velocity = Eigen::Vector3d(perigeeInclinationVel.x(), perigeeInclinationVel.y() * cos_radian - perigeeInclinationVel.z() * sin_radian, perigeeInclinationVel.y() * sin_radian + perigeeInclinationVel.z() * cos_radian);
-
-            inclinationChanged = false;
+            if (t >= 1.0f)
+            {
+                isManeuvering = false;
+            }
         }
 
         
