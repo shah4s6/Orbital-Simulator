@@ -71,7 +71,7 @@ float CalculateOrbitalSpeed(float distance, float semiMajorAxis)
 float CalculateInclination(const Eigen::Vector3d& position, const Eigen::Vector3d & velocity)
 {
     Eigen::Vector3d angularMomentum = position.cross(velocity);
-    double incline = acos(angularMomentum.z() / angularMomentum.norm() * 180.0 / PI);
+    double incline = acos(angularMomentum.z() / angularMomentum.norm()) * 180.0 / PI;
     return incline;
 }
 
@@ -136,8 +136,28 @@ StateVariables calculateDerivatives(const StateVariables& state, double t, doubl
 
 void rk4Method(Satellite& sat, double dt, double GM)
 {
+    double v_mag = sat.velocity.norm();
+    if (v_mag > 20.0) 
+    {
+        sat.velocity = sat.velocity.normalized() * 20.0;
+    }
+
+    double r_mag = sat.position.norm();
+    if (r_mag > 30.0) 
+    {
+        // If too far, scale velocity to bring it back
+        sat.velocity *= 0.95;
+    }
+
     // Initialize the time
     double t = 0.0;
+
+    if (dt > 0.1) dt = 0.1;
+
+    if (sat.position.norm() < 0.5) {
+        // Too close to Earth - don't integrate further
+        return;
+    }
 
     // Current state
     StateVariables current;
@@ -171,6 +191,31 @@ void rk4Method(Satellite& sat, double dt, double GM)
 
 }
 
+void ApplyBurn(Satellite& sat, double deltaV, const Eigen::Vector3d& direction, double GM, double dt)
+{
+    sat.velocity += direction * deltaV;
+
+    Eigen::Vector3d r = sat.position;
+    Eigen::Vector3d v = sat.velocity;
+    double r_magnitude = r.norm();
+    double v_magnitude = v.norm();
+
+    double epsilon = v_magnitude * v_magnitude / 2.0 - GM / r_magnitude;
+    double semiMajorAxis = -GM / (2.0 * epsilon);
+
+    Eigen::Vector3d e_vector = ((v_magnitude * v_magnitude - GM / r_magnitude) * r - (r.dot(v)) * v) / GM;
+    double eccentricity = e_vector.norm();
+}
+
+struct ManueverState
+{
+    bool isActive;
+    float duration;
+    float progress;
+    Eigen::Vector3d deltaVPerSecond;
+    std::string name;
+};
+
 int main()
 {
     InitWindow(1400, 1040, "Orbit Simulator");
@@ -202,7 +247,7 @@ int main()
     double v_perigee = sqrt(GM * (1 + eccentricity) / (semiMajorAxis * (1 - eccentricity)));
     sat.velocity = Eigen::Vector3d(0.0, 0.0, v_perigee);
     sat.mass = 1.0;
-    float satelliteRadius = 0.5f;
+    float satelliteRadius = 0.12f;
 
     Telemetry telemetry = {0};
 
@@ -218,8 +263,11 @@ int main()
     bool orbitChanged = false;
     bool isManeuvering = false;
     float maneuverProgress = 0.0f;
-
-    bool followSatellite = false;
+    bool perigeeBurn = false;
+    bool apogeeBurn = false;
+    static bool needsReset = false;
+    static float lastSemiMajorAxis = semiMajorAxisUI;
+    static float lastEccentricity = eccentricityUI;
 
     // Target orbit visualization
     float targetSemiMajorAxis = semiMajorAxis;
@@ -230,28 +278,55 @@ int main()
     // Inclination variable to enable 3D orbits
     float currentInclination = 0.0f;           // Current inclination (degrees)
     float targetInclination = 0.0f;            // Target inclination obtained by the slider (degrees)
-    bool isInclining = false;
-    float deltaV = 10.0f;
     static float timeWarp = 1.0f; // Initialized at normal speed 1x
     float targetOrbitTimer = 0.0f;
+
+    ManueverState activeManeuver = {false, 0.0f, 0.0f, Eigen::Vector3d::Zero(), ""};
+    static float burnAmount = 0.5f;
+    static float maneuverDuration = 1.0f;
 
     while (!WindowShouldClose())
     {
         float dt = GetFrameTime();
+        if (dt > 0.033f) dt = 0.033f; // Capping the dt to prevent skipping of the trajectory
 
-        // currentInclination = CalculateInclination(sat.position, sat.velocity);
+        if (IsWindowMinimized())
+        {
+            dt = 0.0f;
+        }
 
         if (auto_rotate)
         {
+            // FIRST: Apply any active maneuver delta-V for this frame
+            if (activeManeuver.isActive)
+            {
+                activeManeuver.progress += dt * timeWarp;
+                float t = activeManeuver.progress / activeManeuver.duration;
+                
+                if (t >= 1.0f)
+                {
+                    // Apply remaining delta-V
+                    float remainingFraction = 1.0f - ((activeManeuver.progress - dt * timeWarp) / activeManeuver.duration);
+                    if (remainingFraction > 0.01f) {
+                        sat.velocity += activeManeuver.deltaVPerSecond * remainingFraction;
+                    }
+                    activeManeuver.isActive = false;
+                    TraceLog(LOG_INFO, "Maneuver completed");
+                }
+                else
+                {
+                    // Apply delta-V for this frame
+                    sat.velocity += activeManeuver.deltaVPerSecond * (dt * timeWarp / activeManeuver.duration);
+                }
+            }
+            
+            // THEN: Integrate physics with the updated velocity
             float dtNew = dt * timeWarp;
             rk4Method(sat, dtNew, GM);
-
-            Eigen::Vector3d r = sat.position;
-            double r_magnitude = r.norm();
-
-            Eigen::Vector3d acceleration = -GM * r / (r_magnitude * r_magnitude * r_magnitude);
         }
 
+        // Remove the old maneuver application code that was here
+        
         if (use2p5D)
         {
             // Fixed camera for debugging
@@ -291,8 +366,60 @@ int main()
         float perigeeDistance = (float)telemetry.perigee;
         float apogeeDistance = (float)telemetry.apogee;
 
-        Vector3 perigeePos = {earthPos.x + perigeeDistance, earthPos.y, earthPos.z};
-        Vector3 apogeePos = {earthPos.x - apogeeDistance, earthPos.y, earthPos.z};
+        Vector3 perigeePos = {0,0,0};
+        Vector3 apogeePos = {0,0,0};
+
+        float maxDisplayDistance = 20.0f;  // Don't draw beyond this range
+        float clampedPerigee = fminf(perigeeDistance, maxDisplayDistance);
+        float clampedApogee = fminf(apogeeDistance, maxDisplayDistance);
+        
+        // if (telemetry.eccentricity > 0.01f)  // Non-circular orbit
+        // {
+        //     // Use eccentricity vector direction
+        //     Vector3 perigeeDir = {(float)e_vector.x(), (float)e_vector.y(), (float)e_vector.z()};
+        //     float len = sqrt(perigeeDir.x * perigeeDir.x + perigeeDir.y * perigeeDir.y + perigeeDir.z * perigeeDir.z);
+        //     if (len > 0.01f)
+        //     {
+        //         Vector3 norm = {perigeeDir.x / len, perigeeDir.y / len, perigeeDir.z / len};
+        //         perigeePos = {earthPos.x + perigeeDistance * norm.x, earthPos.y + perigeeDistance * norm.y, earthPos.z + perigeeDistance * norm.z};
+        //         apogeePos = {earthPos.x - apogeeDistance * norm.x, earthPos.y - apogeeDistance * norm.y, earthPos.z - apogeeDistance * norm.z};
+        //     }
+        // }
+        // else  // Circular orbit - use radial direction
+        // {
+        //     Vector3 radialDir = {(float)r.x(), (float)r.y(), (float)r.z()};
+        //     float len = sqrt(radialDir.x * radialDir.x + radialDir.y * radialDir.y + radialDir.z * radialDir.z);
+        //     if (len > 0.01f)
+        //     {
+        //         Vector3 norm = {radialDir.x / len, radialDir.y / len, radialDir.z / len};
+        //         perigeePos = {earthPos.x + perigeeDistance * norm.x, earthPos.y + perigeeDistance * norm.y, earthPos.z + perigeeDistance * norm.z};
+        //         apogeePos = {earthPos.x - apogeeDistance * norm.x, earthPos.y - apogeeDistance * norm.y, earthPos.z - apogeeDistance * norm.z};
+        //     }
+        // }
+
+        if (telemetry.eccentricity >= 0.0f && telemetry.eccentricity < 0.99f && 
+            telemetry.semiMajorAxis > 0.1f && telemetry.semiMajorAxis < 100.0f)
+        {
+            // Get the eccentricity vector direction (points to perigee)
+            if (e_vector.norm() > 0.01f)
+            {
+                Vector3 perigeeDir = {(float)e_vector.x(), (float)e_vector.y(), (float)e_vector.z()};
+                float len = Vector3Length(perigeeDir);
+                if (len > 0.01f)
+                {
+                    Vector3 norm = {perigeeDir.x / len, perigeeDir.y / len, perigeeDir.z / len};
+                    
+                    // Perigee is in direction of eccentricity vector
+                    perigeePos = {earthPos.x + clampedPerigee * norm.x, 
+                                earthPos.y + clampedPerigee * norm.y, 
+                                earthPos.z + clampedPerigee * norm.z};
+                    // Apogee is opposite direction
+                    apogeePos = {earthPos.x - clampedApogee * norm.x, 
+                                earthPos.y - clampedApogee * norm.y, 
+                                earthPos.z - clampedApogee * norm.z};
+                }
+            }
+        }
 
         // Calculate satellite position
         Vector3 satellitePos = {(float)sat.position.x(), (float)sat.position.y(), (float)sat.position.z()};
@@ -345,7 +472,6 @@ int main()
         {
             // Draw ghost target orbit when sliders are adjusted
             Color targetColor = GREEN;
-            DrawOrbitEllipse(earthPos, targetSemiMajorAxis, targetEccentricity, targetDisplayInclination, targetColor);
 
             targetOrbitTimer += dt;
             if (targetOrbitTimer > 3.0f)
@@ -367,16 +493,6 @@ int main()
                 DrawLine3D(trail[i], trail[i + 1], trailColor);
             }
         }
-
-        // Draw current orbit
-        // if (!use2p5D || currentInclination == 0.0f)
-        // {
-        //     DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, currentInclination, WHITE);
-        // }
-        // else
-        // {
-        //     DrawOrbitEllipse(earthPos, (float)telemetry.semiMajorAxis, (float)telemetry.eccentricity, 0.0f, WHITE);
-        // }
 
         DrawSphere(perigeePos, 0.1f, GREEN);
         DrawSphere(apogeePos, 0.1f, YELLOW);
@@ -403,6 +519,9 @@ int main()
 
         ImGui::TextColored(ImVec4 (0.0f, 1.0f, 0.0f, 1.0f), "Perigee: %.2f", telemetry.perigee);
         ImGui::TextColored(ImVec4 (1.0f, 1.0f, 0.0f, 1.0f), "Apogee: %.2f", telemetry.apogee);
+        ImGui::Separator();
+        
+        ImGui::TextColored(ImVec4(0.502, 0.502, 0.502, 1.0), "1 unit = 6371 km");
 
         ImGui::End();
 
@@ -470,10 +589,17 @@ int main()
             targetEccentricity = 0.6f;
             auto_rotate = true;
             showTargetOrbit = false;
+            maneuverProgress = 0.0f;
+            activeManeuver.isActive = false;
             isManeuvering = false;
             maneuverProgress = 0.0f;
 
             trail.clear();
+
+            for (int i = 0; i < 5; i++) 
+            {
+                rk4Method(sat, 0.01, GM);
+            }
             
             // Reset satellite state
             double r_initial = semiMajorAxis * (1 - eccentricity);
@@ -484,26 +610,153 @@ int main()
         ImGui::End();
 
         // Maneuver Controls Panel (Bottom Right)
-        ImGui::SetNextWindowPos(ImVec2(GetScreenWidth()/2 - 20, GetScreenHeight() - 250), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(260, 180), ImGuiCond_Always);
+        // ImGui::SetNextWindowPos(ImVec2(GetScreenWidth() - 270, GetScreenHeight() - 255), ImGuiCond_Always);
+        // ImGui::SetNextWindowSize(ImVec2(260, 245), ImGuiCond_Always);
+        // ImGui::Begin("Maneuvers", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+        // ImGui::Text("Manual Burns");
+        // ImGui::Separator();
+
+        // if (ImGui::Button("Burn at Perigee"))
+        // {
+        //     perigeeBurn = true;
+        // }
+        // if (ImGui::Button("Burn at apogee"))
+        // {
+        //     apogeeBurn = true;
+        // }
+
+        // if (perigeeBurn || apogeeBurn)
+        // {
+        //     if (ImGui::Button("Cancel"))
+        //     {
+        //         perigeeBurn = false;
+        //         apogeeBurn = false;
+        //     }
+        // }
+
+        // static float burnAmount = 0.5f;
+        // ImGui::SliderFloat("Delta-V", &burnAmount, 0.1f, 2.0f, "%.1f m/s");
+
+        // ImGui::Text("Prograde/Retrograde");
+        // if (ImGui::Button("+ Prograde"))
+        // {
+        //     Eigen::Vector3d v_direction = sat.velocity.normalized();
+        //     sat.velocity += v_direction * burnAmount;
+        // }
+        // if (ImGui::Button("- Retrograde"))
+        // {
+        //     Eigen::Vector3d v_direction = sat.velocity.normalized();
+        //     sat.velocity -= v_direction * burnAmount;
+        // }
+
+        // ImGui::End();
+
+        // Maneuver Controls Panel (Simplified)
+        ImGui::SetNextWindowPos(ImVec2(GetScreenWidth() - 270, GetScreenHeight() - 250), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(260, 240), ImGuiCond_Always);
         ImGui::Begin("Maneuvers", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
         ImGui::Text("Manual Burns");
         ImGui::Separator();
 
-        static float burnAmount = 0.5f;
-        ImGui::SliderFloat("Delta-V", &burnAmount, 0.1f, 2.0f, "%.1f m/s");
+        ImGui::SliderFloat("Delta-V", &burnAmount, 0.1f, 3.0f, "%.1f units/s");
+        ImGui::SliderFloat("Burn Duration", &maneuverDuration, 0.5f, 3.0f, "%.1f sec");
 
-        ImGui::Text("Prograde/Retrograde");
+        ImGui::Separator();
+        ImGui::Text("Prograde / Retrograde");
+
+        // Prograde burn
         if (ImGui::Button("+ Prograde"))
         {
-            Eigen::Vector3d v_direction = sat.velocity.normalized();
-            sat.velocity += v_direction * burnAmount;
+            if (!activeManeuver.isActive && sat.velocity.norm() > 0.01)
+            {
+                Eigen::Vector3d v_direction = sat.velocity.normalized();
+                activeManeuver.deltaVPerSecond = v_direction * burnAmount;
+                activeManeuver.duration = maneuverDuration;
+                activeManeuver.progress = 0.0f;
+                activeManeuver.isActive = true;
+                activeManeuver.name = "Prograde";
+                TraceLog(LOG_INFO, "Starting Prograde burn");
+            }
         }
+        ImGui::SameLine();
+
+        // Retrograde burn
         if (ImGui::Button("- Retrograde"))
         {
-            Eigen::Vector3d v_direction = sat.velocity.normalized();
-            sat.velocity -= v_direction * burnAmount;
+            if (!activeManeuver.isActive && sat.velocity.norm() > 0.01)
+            {
+                Eigen::Vector3d v_direction = sat.velocity.normalized();
+                activeManeuver.deltaVPerSecond = -v_direction * burnAmount;
+                activeManeuver.duration = maneuverDuration;
+                activeManeuver.progress = 0.0f;
+                activeManeuver.isActive = true;
+                activeManeuver.name = "Retrograde";
+                TraceLog(LOG_INFO, "Starting Retrograde burn");
+            }
         }
+
+        ImGui::Separator();
+        ImGui::Text("Radial Burns (Small Amounts!)");
+
+        // Radial out (away from Earth) - MUCH smaller default
+        if (ImGui::Button("Radial Out"))
+        {
+            if (!activeManeuver.isActive)
+            {
+                // Get the direction perpendicular to velocity (radial direction)
+                Eigen::Vector3d radial_dir = sat.position.normalized();
+                
+                // Use a much smaller delta-v for radial burns
+                float radialBurnAmount = burnAmount * 0.15f;  // 15% of normal burn
+                
+                activeManeuver.deltaVPerSecond = radial_dir * radialBurnAmount;
+                activeManeuver.duration = maneuverDuration * 0.5f;  // Shorter duration
+                activeManeuver.progress = 0.0f;
+                activeManeuver.isActive = true;
+                activeManeuver.name = "Radial Out";
+                TraceLog(LOG_INFO, "Starting Radial Out burn (%.2f units/s)", radialBurnAmount);
+            }
+        }
+        ImGui::SameLine();
+
+        // Radial in (toward Earth)
+        if (ImGui::Button("Radial In"))
+        {
+            if (!activeManeuver.isActive)
+            {
+                Eigen::Vector3d radial_dir = sat.position.normalized();
+                
+                // Use a much smaller delta-v for radial burns
+                float radialBurnAmount = burnAmount * 0.15f;  // 15% of normal burn
+                
+                activeManeuver.deltaVPerSecond = -radial_dir * radialBurnAmount;
+                activeManeuver.duration = maneuverDuration * 0.5f;
+                activeManeuver.progress = 0.0f;
+                activeManeuver.isActive = true;
+                activeManeuver.name = "Radial In";
+                TraceLog(LOG_INFO, "Starting Radial In burn (%.2f units/s)", radialBurnAmount);
+            }
+        }
+
+        // Cancel button for active maneuver
+        if (activeManeuver.isActive)
+        {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "Active: %s", activeManeuver.name.c_str());
+            ImGui::ProgressBar(activeManeuver.progress / activeManeuver.duration);
+            
+            if (ImGui::Button("Cancel"))
+            {
+                activeManeuver.isActive = false;
+                TraceLog(LOG_INFO, "Maneuver cancelled");
+            }
+        }
+
+        // Help text
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Prograde: Raises orbit");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Retrograde: Lowers orbit");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Radial: Changes eccentricity");
 
         ImGui::End();
 
@@ -518,6 +771,70 @@ int main()
         ImGui::SameLine();
         ImGui::Text("Simulation Speed: %.1fx", timeWarp);
 
+        Eigen::Vector3d angularMomentum = sat.position.cross(sat.velocity);
+        currentInclination = acos(angularMomentum.z() / angularMomentum.norm()) * 180.0 / PI;
+
+        // if (orbitChanged && auto_rotate)
+        // {
+        //     semiMajorAxis = semiMajorAxisUI;
+        //     eccentricity = eccentricityUI;
+
+        //     double currentTrueAnomalyRadian = telemetry.trueAnomaly * PI / 180.0;
+        //     double r_new = semiMajorAxis * (1 - eccentricity * eccentricity) / (1 + eccentricity * cos(currentTrueAnomalyRadian);
+        //     double v_new = sqrt(GM * (2.0 / r_new - 1/ semiMajorAxis));
+
+        //     Eigen::Vector3d e_vector = ((v_magnitude * v_magnitude - GM / r_magnitude) * r(r.dot(v)) * v) / GM;
+        //     Eigen::Vector3d perigeeDirection = e_vector.normalized();
+        //     Eigen::Vector3d normalDirection = r.cross(v).normalized();
+        //     Eigen::Vector3d perpendicularDirection = normalDirection.cross(perigeeDirection);
+
+        //     double cosTrueAnomaly = cos(currentTrueAnomalyRadian);
+        //     double sinTrueAnomaly = sin(currentTrueAnomalyRadian);
+
+        //     sat.position = perigeeDirection * r_new * cosTrueAnomaly + perpendicularDirection * r_new * sinTrueAnomaly;
+
+        //     double h = sqrt(GM * semiMajorAxis * (1- eccentricity * eccentricity));
+        // }
+
+        // After the burn application, add:
+        if (activeManeuver.isActive == false) {
+            // Check for unrealistic velocity
+            if (sat.velocity.norm() > 15.0) {
+                TraceLog(LOG_WARNING, "Velocity too high (%.2f), limiting", sat.velocity.norm());
+                sat.velocity = sat.velocity.normalized() * 15.0;
+            }
+        }
+
+        if (orbitChanged && auto_rotate)
+        {
+            semiMajorAxis = semiMajorAxisUI;
+            eccentricity = eccentricityUI;
+
+            // Recalculate position at current true anomaly
+            double currentTrueAnomalyRadian = telemetry.trueAnomaly * PI / 180.0;
+            double r_new = semiMajorAxis * (1 - eccentricity * eccentricity) / (1 + eccentricity * cos(currentTrueAnomalyRadian));
+            double v_new = sqrt(GM * (2.0 / r_new - 1.0 / semiMajorAxis));
+
+            // Get orbital plane vectors
+            Eigen::Vector3d e_vector_calc = ((v_magnitude * v_magnitude - GM / r_magnitude) * r - (r.dot(v)) * v) / GM;
+            Eigen::Vector3d perigeeDirection = e_vector_calc.normalized();
+            Eigen::Vector3d normalDirection = r.cross(v).normalized();
+            Eigen::Vector3d perpendicularDirection = normalDirection.cross(perigeeDirection);
+
+            double cosTrueAnomaly = cos(currentTrueAnomalyRadian);
+            double sinTrueAnomaly = sin(currentTrueAnomalyRadian);
+
+            // Update position
+            sat.position = perigeeDirection * r_new * cosTrueAnomaly + perpendicularDirection * r_new * sinTrueAnomaly;
+            
+            // Update velocity magnitude and direction
+            double h = sqrt(GM * semiMajorAxis * (1 - eccentricity * eccentricity));
+            double velocityRadial = (GM / h) * eccentricity * sin(currentTrueAnomalyRadian);
+            double velocityTransverse = (GM / h) * (1 + eccentricity * cos(currentTrueAnomalyRadian));
+            
+            sat.velocity = perigeeDirection * velocityRadial + perpendicularDirection * velocityTransverse;
+        }
+
         if (orbitChanged && auto_rotate && !isManeuvering)
         {
             // Start manuevering to change the orbit
@@ -525,10 +842,6 @@ int main()
             maneuverProgress = 0.0f;
             orbitChanged = false;
         }
-
-        
-        Eigen::Vector3d angularMomentum = sat.position.cross(sat.velocity);
-        currentInclination = acos(angularMomentum.z() / angularMomentum.norm() * 180.0 / PI);
 
         if (isManeuvering && auto_rotate)
         {
